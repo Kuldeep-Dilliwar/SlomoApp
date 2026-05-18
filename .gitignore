@@ -1,0 +1,36 @@
+# Gradle
+.gradle/
+build/
+app/build/
+
+# Android Studio / IntelliJ
+.idea/
+*.iml
+local.properties
+.externalNativeBuild/
+.cxx/
+captures/
+output.json
+
+# Native Build
+.ninja_deps
+.ninja_log
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+rules.ninja
+Makefile
+build.ninja
+
+# Large Binaries / SDKs
+app/src/main/cpp/opencv/sdk/native/staticlibs/
+app/src/main/cpp/opencv/sdk/native/3rdparty/libs/
+app/src/main/cpp/opencv/sdk/native/libs/
+
+# Heap Dumps / Logs
+*.hprof
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
