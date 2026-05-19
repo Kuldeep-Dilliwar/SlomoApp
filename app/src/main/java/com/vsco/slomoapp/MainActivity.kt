@@ -31,13 +31,16 @@ class MainActivity : ComponentActivity() {
     private var selectedVideoUri by mutableStateOf<Uri?>(null)
     private var isProcessing by mutableStateOf(false)
     private var isCancelled = false
+    private var isUpscaleEnabled by mutableStateOf(false)
+    private var fpsMultiplier by mutableStateOf(1)
     private var processingProgress by mutableStateOf(0f)
-    private var factor by mutableStateOf(0.5f)
+    private var factor by mutableStateOf(1.0f)
 
     private val selectVideoLauncher = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
         selectedVideoUri = uri
     }
 
+    @OptIn(ExperimentalMaterial3Api::class)
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
@@ -58,17 +61,32 @@ class MainActivity : ComponentActivity() {
                         Spacer(modifier = Modifier.height(8.dp))
                         Text(selectedVideoUri?.let { "Video Selected" } ?: "No video selected")
 
-                        Spacer(modifier = Modifier.height(16.dp))
-                        Text("Slow-Mo Factor: ${String.format("%.2f", factor)}")
-                        Slider(
-                            value = factor,
-                            onValueChange = { factor = it },
-                            valueRange = 0.1f..1.0f,
-                            steps = 8
-                        )
+                        Text("Slow-Mo Factor: ${if (factor == 1.0f) "Normal" else factor.toString() + "x"}")
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+                            listOf(1.0f, 2.0f, 4.0f, 8.0f, 16.0f).forEach { f ->
+                                FilterChip(
+                                    selected = factor == f,
+                                    onClick = { factor = f },
+                                    label = { Text(if (f == 1.0f) "None" else "${f.toInt()}x") }
+                                )
+                            }
+                        }
 
                         Spacer(modifier = Modifier.height(16.dp))
-                        
+                        Text("FPS Multiplier: ${fpsMultiplier}x")
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+                            listOf(1, 2, 4, 6, 8, 16).forEach { m ->
+                                FilterChip(
+                                    selected = fpsMultiplier == m,
+                                    onClick = { fpsMultiplier = m },
+                                    label = { Text("${m}x") },
+                                    enabled = !isProcessing
+                                )
+                            }
+                        }
+
+                        Spacer(modifier = Modifier.height(16.dp))
+
                         if (isProcessing) {
                             LinearProgressIndicator(
                                 progress = processingProgress,
@@ -82,6 +100,16 @@ class MainActivity : ComponentActivity() {
                             Spacer(modifier = Modifier.height(16.dp))
                         }
 
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Checkbox(
+                                checked = isUpscaleEnabled,
+                                onCheckedChange = { isUpscaleEnabled = it },
+                                enabled = !isProcessing
+                            )
+                            Text("Enable 4K AI Upscaling")
+                        }
+
+                        Spacer(modifier = Modifier.height(16.dp))
                         val coroutineScope = rememberCoroutineScope()
                         Button(
                             onClick = {
@@ -125,7 +153,15 @@ class MainActivity : ComponentActivity() {
                 val rotation = rotationStr?.toIntOrNull() ?: 0
                 retriever.release()
 
-                val success = processVideo(inputFile.absolutePath, outputFile.absolutePath, factor, totalFrames, rotation)
+                val success = processVideo(
+                    inputFile.absolutePath,
+                    outputFile.absolutePath,
+                    1.0f / (factor * fpsMultiplier),
+                    totalFrames,
+                    rotation,
+                    isUpscaleEnabled,
+                    fpsMultiplier
+                )
 
                 withContext(Dispatchers.Main) {
                     if (success) {
@@ -211,7 +247,15 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    external fun processVideo(inputPath: String, outputPath: String, factor: Float, totalFrames: Int, rotation: Int): Boolean
+    external fun processVideo(
+        inputPath: String,
+        outputPath: String,
+        factor: Float,
+        totalFrames: Int,
+        rotation: Int,
+        upscale: Boolean,
+        fpsMultiplier: Int
+    ): Boolean
 
     companion object {
         init {

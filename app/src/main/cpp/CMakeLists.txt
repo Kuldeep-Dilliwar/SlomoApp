@@ -12,6 +12,7 @@ target_link_libraries(${CMAKE_PROJECT_NAME}
         GLESv3
         EGL
         android
+        mediandk
         log)
 
 target_link_options(${CMAKE_PROJECT_NAME} PRIVATE "-Wl,-z,max-page-size=16384")

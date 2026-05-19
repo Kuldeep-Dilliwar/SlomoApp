@@ -9,7 +9,7 @@ android {
 
     defaultConfig {
         applicationId = "com.vsco.slomoapp"
-        minSdk = 24
+        minSdk = 26
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
@@ -21,7 +21,7 @@ android {
         }
         
         ndk {
-            abiFilters.add("arm64-v8a")
+            abiFilters.addAll(listOf("arm64-v8a", "x86_64"))
         }
     }
 
