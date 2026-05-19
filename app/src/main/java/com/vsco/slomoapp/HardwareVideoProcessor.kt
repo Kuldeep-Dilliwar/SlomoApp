@@ -43,8 +43,16 @@ class HardwareVideoProcessor {
             val durationUs = format.getLong(MediaFormat.KEY_DURATION)
             val frameRate = try { format.getInteger(MediaFormat.KEY_FRAME_RATE) } catch (e: Exception) { 30 }
 
-            // 1. Setup hardware encoder
-            val outputFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+            // Calculate target dimensions based on metadata rotation
+            var targetWidth = width
+            var targetHeight = height
+            if (rotationDegrees == 90 || rotationDegrees == 270) {
+                targetWidth = height
+                targetHeight = width
+            }
+
+            // 1. Setup hardware encoder using TARGET dimensions
+            val outputFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, targetWidth, targetHeight).apply {
                 setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
                 setInteger(MediaFormat.KEY_BIT_RATE, 15000000)
                 setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
@@ -78,7 +86,7 @@ class HardwareVideoProcessor {
             val eglSurface = EGL14.eglCreateWindowSurface(eglDisplay, configs[0], inputSurface, surfaceAttribs, 0)
             EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
 
-            // 3. Setup OpenGL Program & Direct Buffers
+            // 3. Setup OpenGL Program & Matrices
             val shaderProgram = SlomoShader.createProgram()
             GLES30.glUseProgram(shaderProgram)
 
@@ -90,6 +98,8 @@ class HardwareVideoProcessor {
 
             val posLoc = GLES30.glGetAttribLocation(shaderProgram, "aPosition")
             val texLoc = GLES30.glGetAttribLocation(shaderProgram, "aTexCoord")
+            val stMatrixLoc = GLES30.glGetUniformLocation(shaderProgram, "uSTMatrix")
+            val stMatrix = FloatArray(16) // Holds the OS transform matrix
 
             GLES30.glVertexAttribPointer(posLoc, 2, GLES30.GL_FLOAT, false, 0, vertexBuffer)
             GLES30.glEnableVertexAttribArray(posLoc)
@@ -120,13 +130,14 @@ class HardwareVideoProcessor {
 
             // 5. Muxer Setup
             val muxer = MediaMuxer(outputPath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-            muxer.setOrientationHint(rotationDegrees)
+            // SET TO 0: Our shader matrix physically rotates the pixels, so we strip rotation from the file
+            muxer.setOrientationHint(0)
             var muxerStarted = false
             var trackIndex = -1
 
             // 6. Loop State Variables
-            val decoderInfo = MediaCodec.BufferInfo() // SEPARATE decoder info
-            val encoderInfo = MediaCodec.BufferInfo() // SEPARATE encoder info
+            val decoderInfo = MediaCodec.BufferInfo()
+            val encoderInfo = MediaCodec.BufferInfo()
 
             var isExtractorEOS = false
             var isDecoderEOS = false
@@ -134,7 +145,6 @@ class HardwareVideoProcessor {
             var outPtsUs = 0L
             val ptsIncrementUs = (1000000L / frameRate)
 
-            // Helper function to safely drain the encoder without deadlocking
             val drainEncoder = { timeoutUs: Long ->
                 var encoderStatus = encoder.dequeueOutputBuffer(encoderInfo, timeoutUs)
                 while (encoderStatus >= 0 || encoderStatus == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
@@ -163,11 +173,10 @@ class HardwareVideoProcessor {
                 }
             }
 
-            // 7. The Main Pipeline Loop (Runs until ENCODER finishes, not just decoder)
+            // 7. The Main Pipeline Loop
             while (!isEncoderEOS) {
                 if (isCancelled()) break
 
-                // Feed Decoder
                 if (!isExtractorEOS) {
                     val inIndex = decoder.dequeueInputBuffer(10000)
                     if (inIndex >= 0) {
@@ -184,7 +193,6 @@ class HardwareVideoProcessor {
                     }
                 }
 
-                // Drain Decoder -> Render -> Feed Encoder
                 if (!isDecoderEOS) {
                     val outIndex = decoder.dequeueOutputBuffer(decoderInfo, 10000)
                     if (outIndex >= 0) {
@@ -192,7 +200,6 @@ class HardwareVideoProcessor {
                         decoder.releaseOutputBuffer(outIndex, render)
 
                         if (render) {
-                            // Synchronously wait for the texture to latch
                             synchronized(frameSyncObject) {
                                 var waitCount = 0
                                 while (!frameAvailable && waitCount < 10) {
@@ -204,20 +211,27 @@ class HardwareVideoProcessor {
 
                             try { surfaceTexture.updateTexImage() } catch (e: Exception) {}
 
+                            // Get the OS Matrix to fix orientation and mirroring
+                            surfaceTexture.getTransformMatrix(stMatrix)
+
                             val numIntermediate = (1.0f / factor).toInt() - 1
                             for (i in 0..numIntermediate) {
                                 val t = i.toFloat() / (numIntermediate + 1)
 
-                                GLES30.glViewport(0, 0, width, height)
+                                // USE TARGET DIMENSIONS for the viewport
+                                GLES30.glViewport(0, 0, targetWidth, targetHeight)
                                 GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
+
+                                // Push the matrix and interpolation factor to the GPU
                                 GLES30.glUniform1f(GLES30.glGetUniformLocation(shaderProgram, "uT"), t)
+                                GLES30.glUniformMatrix4fv(stMatrixLoc, 1, false, stMatrix, 0)
+
                                 GLES30.glDrawArrays(GLES30.GL_TRIANGLE_STRIP, 0, 4)
 
                                 EGLExt.eglPresentationTimeANDROID(eglDisplay, eglSurface, outPtsUs * 1000)
                                 EGL14.eglSwapBuffers(eglDisplay, eglSurface)
                                 outPtsUs += ptsIncrementUs
 
-                                // PREVENT DEADLOCK: Empty the encoder queue instantly after pushing a frame
                                 drainEncoder(0)
                             }
                         }
@@ -229,7 +243,6 @@ class HardwareVideoProcessor {
                     }
                 }
 
-                // Master Encoder Drain (catches anything left over)
                 drainEncoder(10000)
             }
 

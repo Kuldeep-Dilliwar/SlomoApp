@@ -3,13 +3,18 @@ package com.vsco.slomoapp
 import android.opengl.GLES30
 
 object SlomoShader {
+    // Notice aTexCoord is now a vec4 to allow matrix multiplication
     private const val VERTEX_SHADER = """#version 300 es
         in vec4 aPosition;
-        in vec2 aTexCoord;
+        in vec4 aTexCoord;
+        
+        uniform mat4 uSTMatrix;
         out vec2 vTexCoord;
+        
         void main() {
             gl_Position = aPosition;
-            vTexCoord = aTexCoord;
+            // The OS matrix automatically fixes upside-down/mirrored frames
+            vTexCoord = (uSTMatrix * aTexCoord).xy;
         }
     """
 
