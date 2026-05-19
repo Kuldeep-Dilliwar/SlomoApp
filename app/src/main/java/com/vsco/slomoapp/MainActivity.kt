@@ -1,13 +1,11 @@
 package com.vsco.slomoapp
 
 import android.content.ContentValues
-import android.content.Intent
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.MediaStore
-import android.provider.OpenableColumns
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -24,7 +22,6 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.io.OutputStream
 
 class MainActivity : ComponentActivity() {
 
@@ -68,7 +65,7 @@ class MainActivity : ComponentActivity() {
                         )
 
                         Spacer(modifier = Modifier.height(16.dp))
-                        
+
                         if (isProcessing) {
                             LinearProgressIndicator(
                                 progress = processingProgress,
@@ -107,7 +104,6 @@ class MainActivity : ComponentActivity() {
     private suspend fun processVideoFile(uri: Uri) {
         withContext(Dispatchers.IO) {
             try {
-                // Copy to cache dir to get a real file path for OpenCV
                 val inputStream = contentResolver.openInputStream(uri)
                 val inputFile = File(cacheDir, "input.mp4")
                 val outputStream = FileOutputStream(inputFile)
@@ -116,28 +112,33 @@ class MainActivity : ComponentActivity() {
                 outputStream.close()
 
                 val outputFile = File(cacheDir, "output_slomo.mp4")
+                if (outputFile.exists()) outputFile.delete()
 
                 val retriever = MediaMetadataRetriever()
                 retriever.setDataSource(inputFile.absolutePath)
-                val totalFramesStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_FRAME_COUNT)
-                val totalFrames = totalFramesStr?.toIntOrNull() ?: 0
                 val rotationStr = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)
                 val rotation = rotationStr?.toIntOrNull() ?: 0
                 retriever.release()
 
-                val success = processVideo(inputFile.absolutePath, outputFile.absolutePath, factor, totalFrames, rotation)
+                val processor = HardwareVideoProcessor()
+                val success = processor.processVideo(
+                    inputPath = inputFile.absolutePath,
+                    outputPath = outputFile.absolutePath,
+                    factor = factor,
+                    rotationDegrees = rotation,
+                    onProgress = { progress ->
+                        runOnUiThread { processingProgress = progress }
+                    },
+                    isCancelled = { isCancelled }
+                )
 
                 withContext(Dispatchers.Main) {
                     if (success) {
-                        if (!isCancelled) {
-                            val galleryUri = saveVideoToGallery(outputFile)
-                            if (galleryUri != null) {
-                                Toast.makeText(this@MainActivity, "Saved to Gallery!", Toast.LENGTH_LONG).show()
-                            } else {
-                                Toast.makeText(this@MainActivity, "Saved to ${outputFile.absolutePath}", Toast.LENGTH_LONG).show()
-                            }
+                        val galleryUri = saveVideoToGallery(outputFile)
+                        if (galleryUri != null) {
+                            Toast.makeText(this@MainActivity, "Saved to Gallery!", Toast.LENGTH_LONG).show()
                         } else {
-                            Toast.makeText(this@MainActivity, "Processing cancelled", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(this@MainActivity, "Saved to ${outputFile.absolutePath}", Toast.LENGTH_LONG).show()
                         }
                     } else {
                         val message = if (isCancelled) "Processing cancelled" else "Processing failed"
@@ -155,22 +156,6 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
-    }
-
-    /**
-     * Called from native code to update progress
-     */
-    fun onProgressUpdate(percentage: Float) {
-        runOnUiThread {
-            processingProgress = percentage
-        }
-    }
-
-    /**
-     * Called from native code to check if processing should be cancelled
-     */
-    fun isCancelled(): Boolean {
-        return isCancelled
     }
 
     private suspend fun saveVideoToGallery(file: File): Uri? {
@@ -208,14 +193,6 @@ class MainActivity : ComponentActivity() {
             } catch (e: Exception) {
                 null
             }
-        }
-    }
-
-    external fun processVideo(inputPath: String, outputPath: String, factor: Float, totalFrames: Int, rotation: Int): Boolean
-
-    companion object {
-        init {
-            System.loadLibrary("slomoapp")
         }
     }
 }
