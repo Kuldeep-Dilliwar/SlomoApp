@@ -1,0 +1,73 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// Bindings
+layout(binding = 0, r8) uniform readonly image2D imgPrev;
+layout(binding = 1, r8) uniform readonly image2D imgCurr;
+layout(binding = 2, rg32f) uniform image2D flowMap;
+
+// DIS Parameters
+const int PATCH_SIZE = 8;
+const int MAX_ITERATIONS = 5;
+
+void main() {
+    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 imgSize = imageSize(imgPrev);
+
+    if (pos.x >= imgSize.x || pos.y >= imgSize.y) return;
+
+    // Initial flow guess (from previous pyramid scale if applicable)
+    vec2 currentFlow = imageLoad(flowMap, pos).rg;
+
+    // Inverse Lucas-Kanade Iteration
+    for (int iter = 0; iter < MAX_ITERATIONS; ++iter) {
+        float H11 = 0.0, H12 = 0.0, H22 = 0.0;
+        float b1 = 0.0, b2 = 0.0;
+
+        // Evaluate patch
+        for (int y = -PATCH_SIZE/2; y < PATCH_SIZE/2; ++y) {
+            for (int x = -PATCH_SIZE/2; x < PATCH_SIZE/2; ++x) {
+                ivec2 p = pos + ivec2(x, y);
+
+                // Bounds check for gradient computation
+                if (p.x <= 0 || p.x >= imgSize.x - 1 || p.y <= 0 || p.y >= imgSize.y - 1) continue;
+
+                // Sample previous frame gradients
+                float I_x = (imageLoad(imgPrev, p + ivec2(1, 0)).r - imageLoad(imgPrev, p - ivec2(1, 0)).r) * 0.5;
+                float I_y = (imageLoad(imgPrev, p + ivec2(0, 1)).r - imageLoad(imgPrev, p - ivec2(0, 1)).r) * 0.5;
+
+                // Temporal difference using current flow projection
+                // Note: Simplified version using round() for discrete sampling
+                ivec2 warpedP = p + ivec2(round(currentFlow.x), round(currentFlow.y));
+
+                if (warpedP.x < 0 || warpedP.x >= imgSize.x || warpedP.y < 0 || warpedP.y >= imgSize.y) continue;
+
+                float I_t = imageLoad(imgCurr, warpedP).r - imageLoad(imgPrev, p).r;
+
+                // Build Hessian matrix and b vector
+                H11 += I_x * I_x;
+                H12 += I_x * I_y;
+                H22 += I_y * I_y;
+
+                b1 += I_x * I_t;
+                b2 += I_y * I_t;
+            }
+        }
+
+        // Solve 2x2 linear system: H * delta = b
+        float det = H11 * H22 - H12 * H12;
+        if (abs(det) < 1e-5) break; // Avoid division by zero
+
+        vec2 deltaFlow;
+        deltaFlow.x = (H22 * b1 - H12 * b2) / det;
+        deltaFlow.y = (H11 * b2 - H12 * b1) / det;
+
+        currentFlow -= deltaFlow; // Update flow
+
+        // Convergence check
+        if (length(deltaFlow) < 0.01) break;
+    }
+
+    // Write final dense flow for this pixel
+    imageStore(flowMap, pos, vec4(currentFlow, 0.0, 0.0));
+}

@@ -4,12 +4,79 @@
 #include <opencv2/opencv.hpp>
 #include <opencv2/video/tracking.hpp>
 #include <EGL/egl.h>
-#include <GLES3/gl3.h>
+#include <GLES3/gl31.h>
 #include <vector>
+#include <cmath>
 
 #define LOG_TAG "SlomoAppNative"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+
+const char* DIS_COMPUTE_SHADER =
+    "#version 310 es\n"
+    "layout(local_size_x = 16, local_size_y = 16) in;\n"
+    "\n"
+    "layout(binding = 0, r32f) readonly uniform highp image2D imgPrev;\n"
+    "layout(binding = 1, r32f) readonly uniform highp image2D imgCurr;\n"
+    "layout(binding = 2, rg32f) uniform highp image2D flowMap;\n"
+    "\n"
+    "const int PATCH_SIZE = 8;\n"
+    "const int MAX_ITERATIONS = 5;\n"
+    "\n"
+    "void main() {\n"
+    "    ivec2 pos = ivec2(gl_GlobalInvocationID.xy);\n"
+    "    ivec2 imgSize = imageSize(imgPrev);\n"
+    "\n"
+    "    if (pos.x >= imgSize.x || pos.y >= imgSize.y) return;\n"
+    "\n"
+    "    vec2 currentFlow = imageLoad(flowMap, pos).rg;\n"
+    "\n"
+    "    for (int iter = 0; iter < MAX_ITERATIONS; ++iter) {\n"
+    "        float H11 = 0.0, H12 = 0.0, H22 = 0.0;\n"
+    "        float b1 = 0.0, b2 = 0.0;\n"
+    "\n"
+    "        for (int y = -PATCH_SIZE/2; y < PATCH_SIZE/2; ++y) {\n"
+    "            for (int x = -PATCH_SIZE/2; x < PATCH_SIZE/2; ++x) {\n"
+    "                ivec2 p = pos + ivec2(x, y);\n"
+    "                if (p.x <= 0 || p.x >= imgSize.x - 1 || p.y <= 0 || p.y >= imgSize.y - 1) continue;\n"
+    "\n"
+    "                float I_x = (imageLoad(imgPrev, p + ivec2(1, 0)).r - imageLoad(imgPrev, p - ivec2(1, 0)).r) * 0.5;\n"
+    "                float I_y = (imageLoad(imgPrev, p + ivec2(0, 1)).r - imageLoad(imgPrev, p - ivec2(0, 1)).r) * 0.5;\n"
+    "\n"
+    "                vec2 warpedP = vec2(p) + currentFlow;\n"
+    "                if (warpedP.x < 0.0 || warpedP.x >= float(imgSize.x-1) || warpedP.y < 0.0 || warpedP.y >= float(imgSize.y-1)) continue;\n"
+    "\n"
+    "                // Bi-linear interpolation for current frame sampling\n"
+    "                ivec2 p00 = ivec2(floor(warpedP));\n"
+    "                vec2 f = warpedP - vec2(p00);\n"
+    "                float val00 = imageLoad(imgCurr, p00).r;\n"
+    "                float val10 = imageLoad(imgCurr, p00 + ivec2(1, 0)).r;\n"
+    "                float val01 = imageLoad(imgCurr, p00 + ivec2(0, 1)).r;\n"
+    "                float val11 = imageLoad(imgCurr, p00 + ivec2(1, 1)).r;\n"
+    "                float I_curr = mix(mix(val00, val10, f.x), mix(val01, val11, f.x), f.y);\n"
+    "\n"
+    "                float I_t = I_curr - imageLoad(imgPrev, p).r;\n"
+    "\n"
+    "                H11 += I_x * I_x;\n"
+    "                H12 += I_x * I_y;\n"
+    "                H22 += I_y * I_y;\n"
+    "                b1 += I_x * I_t;\n"
+    "                b2 += I_y * I_t;\n"
+    "            }\n"
+    "        }\n"
+    "\n"
+    "        float det = H11 * H22 - H12 * H12;\n"
+    "        if (abs(det) < 1e-5) break;\n"
+    "\n"
+    "        vec2 deltaFlow;\n"
+    "        deltaFlow.x = (H22 * b1 - H12 * b2) / det;\n"
+    "        deltaFlow.y = (H11 * b2 - H12 * b1) / det;\n"
+    "\n"
+    "        currentFlow -= deltaFlow;\n"
+    "        if (length(deltaFlow) < 0.01) break;\n"
+    "    }\n"
+    "    imageStore(flowMap, pos, vec4(currentFlow, 0.0, 0.0));\n"
+    "}\n";
 
 const char* VERTEX_SHADER =
         "#version 300 es\n"
@@ -78,7 +145,7 @@ Java_com_vsco_slomoapp_MainActivity_processVideo(
     const char* inPath = env->GetStringUTFChars(inputPath, nullptr);
     const char* outPath = env->GetStringUTFChars(outputPath, nullptr);
 
-    LOGI("Processing video: %s to %s with factor %f, rotation %d", inPath, outPath, factor, rotation);
+    LOGI("Processing video: %s to %s with factor %f, rotation %d (GPU DIS Accelerated)", inPath, outPath, factor, rotation);
 
     jboolean result = JNI_FALSE;
     cv::VideoCapture cap;
@@ -118,7 +185,7 @@ Java_com_vsco_slomoapp_MainActivity_processVideo(
             }
         }
 
-        // Setup EGL Headless (GLES 3.0)
+        // Setup EGL Headless (GLES 3.1 for Compute Shaders)
         display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
         eglInitialize(display, nullptr, nullptr);
         EGLint configAttribs[] = {
@@ -137,49 +204,65 @@ Java_com_vsco_slomoapp_MainActivity_processVideo(
         surface = eglCreatePbufferSurface(display, config, pbufferAttribs);
         eglMakeCurrent(display, surface, surface, context);
 
-        // OPTIMIZATION: Prevent memory alignment crashes on cropped/odd resolution videos
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
         glPixelStorei(GL_PACK_ALIGNMENT, 1);
 
+        // Compile and Link Compute Shader
+        GLuint cs = createShader(GL_COMPUTE_SHADER, DIS_COMPUTE_SHADER);
+        GLuint computeProgram = glCreateProgram();
+        glAttachShader(computeProgram, cs);
+        glLinkProgram(computeProgram);
+
+        // Compile and Link Interpolation Shaders
         GLuint vs = createShader(GL_VERTEX_SHADER, VERTEX_SHADER);
         GLuint fs = createShader(GL_FRAGMENT_SHADER, FRAGMENT_SHADER);
-        GLuint program = glCreateProgram();
-        glAttachShader(program, vs);
-        glAttachShader(program, fs);
-        glLinkProgram(program);
-        glUseProgram(program);
+        GLuint renderProgram = glCreateProgram();
+        glAttachShader(renderProgram, vs);
+        glAttachShader(renderProgram, fs);
+        glLinkProgram(renderProgram);
 
-        GLint posLoc = glGetAttribLocation(program, "aPosition");
-        GLint texLoc = glGetAttribLocation(program, "aTexCoord");
-        GLint texSizeLoc = glGetUniformLocation(program, "uTexSize");
-        GLint tLoc = glGetUniformLocation(program, "uT");
-
-        glUniform2f(texSizeLoc, (float)width, (float)height);
+        GLint posLoc = glGetAttribLocation(renderProgram, "aPosition");
+        GLint texLoc = glGetAttribLocation(renderProgram, "aTexCoord");
+        GLint texSizeLoc = glGetUniformLocation(renderProgram, "uTexSize");
+        GLint tLoc = glGetUniformLocation(renderProgram, "uT");
 
         float vertices[] = { -1, -1, 1, -1, -1, 1, 1, 1 };
         float texCoords[] = { 0, 0, 1, 0, 0, 1, 1, 1 };
-        glVertexAttribPointer(posLoc, 2, GL_FLOAT, GL_FALSE, 0, vertices);
-        glEnableVertexAttribArray(posLoc);
-        glVertexAttribPointer(texLoc, 2, GL_FLOAT, GL_FALSE, 0, texCoords);
-        glEnableVertexAttribArray(texLoc);
 
-        GLuint textures[3];
-        glGenTextures(3, textures);
-        for(int i=0; i<3; ++i) {
+        GLuint textures[5];
+        glGenTextures(5, textures);
+
+        // Textures for compute shader inputs (Gray)
+        for(int i=0; i<2; ++i) {
             glBindTexture(GL_TEXTURE_2D, textures[i]);
-            // FIX: Float textures (optical flow) require GL_NEAREST to function in GLES3
-            GLint filter = (i == 2) ? GL_NEAREST : GL_LINEAR;
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glTexStorage2D(GL_TEXTURE_2D, 1, GL_R32F, width, height);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        }
+
+        // Texture for flow map (Output of compute, input of interpolation)
+        glBindTexture(GL_TEXTURE_2D, textures[2]);
+        glTexStorage2D(GL_TEXTURE_2D, 1, GL_RG32F, width, height);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        // Clear flow map initially by uploading zero data
+        {
+            std::vector<float> zeroData(width * height * 2, 0.0f);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RG, GL_FLOAT, zeroData.data());
+        }
+
+        // Textures for interpolation (RGB)
+        for(int i=3; i<5; ++i) {
+            glBindTexture(GL_TEXTURE_2D, textures[i]);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, nullptr);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         }
 
         jclass clazz = env->GetObjectClass(thiz);
         jmethodID progressMethodId = env->GetMethodID(clazz, "onProgressUpdate", "(F)V");
         jmethodID cancelMethodId = env->GetMethodID(clazz, "isCancelled", "()Z");
 
-        auto dis = cv::DISOpticalFlow::create(cv::DISOpticalFlow::PRESET_MEDIUM);
         cv::Mat prevFrame, currFrame, prevGray, currGray;
 
         cap >> prevFrame;
@@ -187,7 +270,6 @@ Java_com_vsco_slomoapp_MainActivity_processVideo(
             throw cv::Exception(cv::Error::StsError, "Video is empty", "processVideo", __FILE__, __LINE__);
         }
 
-        // Centralized frame handler: manages rotation and strict RGB output for MediaCodec
         auto handleFrame = [&](cv::Mat& frame, bool write) {
             cv::Mat processed = frame.clone();
             if (rotation == 90) cv::rotate(processed, processed, cv::ROTATE_90_CLOCKWISE);
@@ -196,7 +278,6 @@ Java_com_vsco_slomoapp_MainActivity_processVideo(
 
             if (write) {
                 cv::Mat rgbFrame;
-                // FIX: MediaCodec underlying VideoWriter expects RGB, converting from BGR fixes Smurf Vision
                 cv::cvtColor(processed, rgbFrame, cv::COLOR_BGR2RGB);
                 writer.write(rgbFrame);
             }
@@ -213,42 +294,68 @@ Java_com_vsco_slomoapp_MainActivity_processVideo(
             if (currFrame.empty()) break;
 
             cv::cvtColor(currFrame, currGray, cv::COLOR_BGR2GRAY);
-            cv::Mat flow;
-            dis->calc(prevGray, currGray, flow);
 
-            // OPTIMIZATION: Texture uploads are pulled OUTSIDE the interpolation loop.
-            // This prevents redundant CPU-to-GPU memory copies for intermediate frames.
-            glActiveTexture(GL_TEXTURE0);
+            // 1. Upload Grayscale frames for Compute Shader
+            cv::Mat prevGrayFloat, currGrayFloat;
+            prevGray.convertTo(prevGrayFloat, CV_32F, 1.0/255.0);
+            currGray.convertTo(currGrayFloat, CV_32F, 1.0/255.0);
+
             glBindTexture(GL_TEXTURE_2D, textures[0]);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, prevFrame.data);
-            glUniform1i(glGetUniformLocation(program, "uTexPrev"), 0);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RED, GL_FLOAT, prevGrayFloat.data);
+
+            glBindTexture(GL_TEXTURE_2D, textures[1]);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RED, GL_FLOAT, currGrayFloat.data);
+
+            // 2. Dispatch Compute Shader for Optical Flow
+            glUseProgram(computeProgram);
+            glBindImageTexture(0, textures[0], 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
+            glBindImageTexture(1, textures[1], 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
+            glBindImageTexture(2, textures[2], 0, GL_FALSE, 0, GL_READ_WRITE, GL_RG32F);
+
+            glDispatchCompute((width + 15) / 16, (height + 15) / 16, 1);
+            glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+
+            // 3. Upload RGB frames for Interpolation
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, textures[3]);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, prevFrame.data);
 
             glActiveTexture(GL_TEXTURE1);
-            glBindTexture(GL_TEXTURE_2D, textures[1]);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, currFrame.data);
-            glUniform1i(glGetUniformLocation(program, "uTexCurr"), 1);
+            glBindTexture(GL_TEXTURE_2D, textures[4]);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, currFrame.data);
+
+            // 4. Interpolation Loop
+            glUseProgram(renderProgram);
+            glUniform2f(texSizeLoc, (float)width, (float)height);
+            glVertexAttribPointer(posLoc, 2, GL_FLOAT, GL_FALSE, 0, vertices);
+            glEnableVertexAttribArray(posLoc);
+            glVertexAttribPointer(texLoc, 2, GL_FLOAT, GL_FALSE, 0, texCoords);
+            glEnableVertexAttribArray(texLoc);
+
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, textures[3]);
+            glUniform1i(glGetUniformLocation(renderProgram, "uTexPrev"), 0);
+
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, textures[4]);
+            glUniform1i(glGetUniformLocation(renderProgram, "uTexCurr"), 1);
 
             glActiveTexture(GL_TEXTURE2);
             glBindTexture(GL_TEXTURE_2D, textures[2]);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RG32F, width, height, 0, GL_RG, GL_FLOAT, flow.data);
-            glUniform1i(glGetUniformLocation(program, "uTexFlow"), 2);
+            glUniform1i(glGetUniformLocation(renderProgram, "uTexFlow"), 2);
 
             int numIntermediate = (int)(1.0f / factor) - 1;
             for (int i = 1; i <= numIntermediate; ++i) {
                 float t = (float)i / (numIntermediate + 1);
-
                 glUniform1f(tLoc, t);
                 glViewport(0, 0, width, height);
                 glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 
-                // FIX: Read as RGBA to strictly comply with GLES3 specifications and prevent crashes
                 cv::Mat blendedRGBA(height, width, CV_8UC4);
                 glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, blendedRGBA.data);
 
-                // Strip the alpha channel to return to our baseline BGR format for handleFrame
                 cv::Mat blendedBGR;
                 cv::cvtColor(blendedRGBA, blendedBGR, cv::COLOR_BGRA2BGR);
-
                 handleFrame(blendedBGR, true);
             }
 
